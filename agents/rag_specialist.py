@@ -1,7 +1,9 @@
 # agents/rag_specialist.py
 import logging
-from typing import Dict, Any
-# Import from core_rag instead of agentic_backend
+import numpy as np
+from typing import Dict, Any, List
+
+# Import from core_rag (which is already updated)
 from core_rag import retrieval_node, context_grader_node, response_generation_node
 
 logger = logging.getLogger(__name__)
@@ -18,7 +20,14 @@ def _get_specialist_prompt(specialist_type: str) -> str:
     }
     return prompts.get(specialist_type, prompts["GENERAL_SPECIALIST"])
 
-def run_specialist_rag(state: Dict[str, Any], vector_store, chunk_texts, chunk_metadatas) -> Dict[str, Any]:
+# --- KEY CHANGE ---
+# The function signature is updated to accept 'kb_data'
+def run_specialist_rag(
+    state: Dict[str, Any], 
+    vector_store: np.ndarray, 
+    kb_data: List[Dict]
+) -> Dict[str, Any]:
+# ------------------
     """
     A specialist sub-graph that runs the RAG pipeline.
     This agent handles all technical RAG queries.
@@ -27,7 +36,10 @@ def run_specialist_rag(state: Dict[str, Any], vector_store, chunk_texts, chunk_m
     
     try:
         # 1. Retrieve context (with category filtering)
-        state = retrieval_node(state, vector_store, chunk_texts, chunk_metadatas)
+        # --- KEY CHANGE ---
+        # Pass the single 'kb_data' object to the updated retrieval_node
+        state = retrieval_node(state, vector_store, kb_data)
+        # ------------------
         
         # 2. Grade context
         state = context_grader_node(state)
