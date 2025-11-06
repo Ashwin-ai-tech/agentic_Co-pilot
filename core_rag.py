@@ -2,6 +2,8 @@
 import numpy as np
 import logging
 from typing import List, Dict, Optional, Any
+from utils import _parse_ticket_details_from_history
+import json
 
 # Import from utils
 from utils import call_llm, get_cached_query_embedding, manual_cohere_rerank
@@ -145,11 +147,62 @@ Is the context relevant? (Yes/No):
         
     return state
 
+def _check_user_frustration(query: str, history: List[Dict]) -> bool:
+    """
+    Uses a quick LLM call to check if the user is stuck or frustrated.
+    """
+    if not history:
+        return False # Not frustrated on the first turn
+
+    # Combine the user's new query with the bot's last response
+    last_bot_answer = history[-1].get("answer", "")
+    
+    # --- THIS IS THE NEW, SMARTER LOGIC ---
+    try:
+        prompt = f"""
+        Analyze the following interaction. The bot just gave a solution, and the user replied.
+        Does the user's reply express frustration, confusion, or that the solution failed?
+        Respond with ONLY one word: "Yes" or "No".
+
+        Bot's last message: "{last_bot_answer[-200:]}..." 
+        User's new reply: "{query}"
+
+        Analysis (Yes/No):
+        """
+        response = call_llm(prompt, model="llama-3.1-8b-instant", temperature=0, max_tokens=5).strip().lower()
+        
+        is_frustrated = "yes" in response
+        logger.info(f"Frustration check: Bot said '...{last_bot_answer[-50:]}', User said '{query}'. Analysis: {response}")
+        return is_frustrated
+        
+    except Exception as e:
+        logger.error(f"Frustration check LLM call failed: {e}")
+        # Fallback to simple keyword check on error
+        keywords = ["no", "didn't work", "still broken", "stuck", "useless", "exhausted", "not solved"]
+        return any(keyword in query.lower() for keyword in keywords)
+    # --- END NEW LOGIC ---
+
 def response_generation_node(state: Dict[str, Any], specialist_prompt: Optional[str] = None) -> Dict[str, Any]:
-    """Generates final response based on context, intent, or a specialist prompt."""
+    """
+    Generates final response based on context, intent, or a specialist prompt.
+    NOW includes conversational history and frustration-based ticketing.
+    """
     query = state["query"]
     retrieved_context = state["retrieved_context"]
     context_is_relevant = state.get("context_is_relevant", False)
+    
+    # --- NEW: Get conversation history ---
+    history = state.get('conversation_history', [])
+    history_str = "\n".join([
+        f"User: {turn.get('query', '')}\nBot: {turn.get('answer', '')}" 
+        for turn in history[-3:] # Get last 3 turns
+    ])
+    # -------------------------------------
+    
+    if "metadata" not in state:
+        state["metadata"] = {}
+    state["metadata"]["show_ticket_offer"] = False
+    state["metadata"]["pending_ticket_details_json"] = None
     
     if state.get("specialist_response"):
         state["final_response"] = state["specialist_response"]
@@ -157,45 +210,89 @@ def response_generation_node(state: Dict[str, Any], specialist_prompt: Optional[
 
     if context_is_relevant:
         context_str = "\n\n".join([
-            # This logic now works perfectly as 'metadata' is the full item dict
             f"Reference {i+1} (Source: {ctx['metadata'].get('source', 'N/A')} - {ctx['metadata'].get('section', 'N/A')}):\n{ctx['content']}"
             for i, ctx in enumerate(retrieved_context[:3])
         ])
         
-        if specialist_prompt:
-            base_prompt = specialist_prompt
-        else:
-            base_prompt = "You are Astra, an IT support specialist. Your goal is to provide a helpful, empathetic, and actionable response."
+        base_prompt = specialist_prompt or "You are Astra, an IT support specialist."
         
+        # --- NEW CONTEXT-AWARE PROMPT ---
         prompt = f"""{base_prompt}
         
-You have been given the following verified, relevant knowledge:
-KNOWLEDGE:
-{context_str}
+You are in a conversation with a user. Here is the recent history:
+--- CONVERSATION HISTORY ---
+{history_str}
+--- END HISTORY ---
 
-USER QUERY: {query}
+Based on the history, the user's *newest query* is: "{query}"
+
+You have found the following relevant knowledge to answer the *newest query*:
+--- KNOWLEDGE ---
+{context_str}
+--- END KNOWLEDGE ---
 
 INSTRUCTIONS:
-- Answer the user's query **using only the KNOWLEDGE provided**.
-- **DO NOT** say "Reference 1" or "based on the knowledge". Just *use* the knowledge.
-- Provide clear, step-by-step guidance.
-- End with an offer for further assistance.
+- Use the CONVERSATION HISTORY to understand the user's follow-up questions.
+- Use the KNOWLEDGE to provide a direct, helpful answer to the *newest query*.
+- **If the user is asking a follow-up about a previous step (e.g., "what is a hard reset?"), use the KNOWLEDGE to explain it.**
+- Format your entire response using Markdown.
+- **Use *only* the KNOWLEDGE provided.** Do not say "based on the knowledge".
+- Conclude by asking if further assistance is needed or if they have more questions.
 
-Response:
+Response (in Markdown):
 """
+        # --- END OF NEW PROMPT ---
+        
         response = call_llm(prompt)
     
     else:
-        prompt = f"""You are Astra, an IT support specialist. The user has asked: "{query}"
+        # --- THIS IS YOUR NEW "SMART TICKET" LOGIC ---
+        logger.warning(f"No relevant context found for query: {query}")
+        
+        # 1. Check for user frustration
+        is_frustrated = _check_user_frustration(query, history)
+        
+        if is_frustrated:
+            # 2. If frustrated, offer a stateful ticket
+            logger.info("User seems frustrated. GENERATING STATEFUL TICKET OFFER.")
+            try:
+                ticket_details = _parse_ticket_details_from_history(history, query)
+                state["metadata"]["show_ticket_offer"] = True
+                state["metadata"]["pending_ticket_details_json"] = json.dumps(ticket_details)
+                
+                response = (
+                    f"I'm sorry that the previous steps didn't help and I couldn't find a specific solution for: "
+                    f"'{ticket_details.get('short_description', 'your issue')}'."
+                    f"\n\nI understand this can be frustrating. **Would you like me to open a ticket** for you with these details?"
+                )
+            except Exception as e:
+                logger.error(f"Error during RAG fallback ticket offer: {e}")
+                response = "I'm sorry, I couldn't find a solution and I also ran into an error trying to offer a ticket. Please try rephrasing your issue."
+        
+        else:
+            # 3. If NOT frustrated (first failure), just give general advice
+            #    and DO NOT offer a ticket.
+            logger.info("User is not frustrated. Generating general fallback.")
+            
+            prompt = f"""You are Astra, an IT support specialist. The user has asked: "{query}"
+            
+You don't have a specific document for this. 
+Provide a general, helpful response.
 
-Since I don't have specific documentation for this issue, please provide general troubleshooting guidance:
+INSTRUCTIONS:
+- **Format your entire response using Markdown.**
+- Address the issue with empathy.
+- Provide a heading like `### General Troubleshooting`.
+- Suggest 2-3 basic diagnostic steps as a **numbered list** (`1.`, `2.`, `3.`).
+- **DO NOT offer to create a ticket.**
+- Instead, conclude by asking the user: "Please let me know if these steps work, or if you're still stuck."
 
-1. Start with empathy (e.g., "I'm sorry to hear you're having trouble...").
-2. Suggest 2-3 basic diagnostic steps (e.g., "Have you tried restarting the application?", "Can you check your internet connection?").
-3. Recommend escalating to human support or logging a ticket if the issue persists.
-
-Response:"""
-        response = call_llm(prompt)
+Response (in Markdown):
+"""
+            response = call_llm(prompt)
+            # We do NOT set show_ticket_offer = True here.
+            
+    # --- END OF NEW LOGIC ---
         
     state["final_response"] = response
     return state
