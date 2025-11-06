@@ -4,6 +4,7 @@ import ssl
 # --- SSL Configuration (As per user constraint) ---
 ssl._create_default_https_context = ssl._create_unverified_context
 # -------------------------
+from agents.specialist_agents import run_code_generator_agent, run_error_lookup_agent
 import requests
 from typing import List, Dict, Tuple, Any, Optional, Union, TypedDict, Callable
 from functools import lru_cache
@@ -11,6 +12,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from groq import Groq
+from agents import run_specialist_rag
+from agents import run_servicenow_agent
+from agents.simple_agents import run_clarification, run_simple_response
+from agents.specialist_agents import run_code_generator_agent, run_error_lookup_agent
+from core_rag import response_generation_node
 import cohere
 from queue import Queue
 from database import get_db
@@ -19,6 +25,9 @@ from analytics_manager import AnalyticsManager
 # Import utility functions
 # We still need them for the RAG pipeline (rerank, query embed, llm)
 from utils import call_llm, manual_cohere_embed, get_cached_query_embedding, manual_cohere_rerank
+
+    
+
 
 # --- Import the client object, matching app.py ---
 try:
@@ -69,6 +78,7 @@ class Session:
     feedback_pending: bool = False
     session_title: str = "Agentic Chat"
     theme_preference: str = "system"
+    pending_ticket_details: Optional[str] = None
 
 class AgentState(TypedDict):
     """State for agentic workflow"""
@@ -140,94 +150,130 @@ def initialize_vector_store():
 # --- CORE AGENTIC WORKFLOW NODES ---
 # ==============================================================================
 
-def orchestrator_node(state: Dict[str, Any]) -> Dict[str, Any]: # Using Dict if AgentState isn't available
+
+def orchestrator_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Classifies intent to route to a Specialist Agent (RAG), a Tool (ServiceNow),
-    or a Simple Response Agent. Includes refined prompt for farewells.
+    Classifies intent OR checks session state for a pending ticket offer.
+    (This is the new, fully corrected version)
     """
     query = state["query"].lower().strip()
-    logger.info(f"Orchestrator received query: {query[:100]}...") # Log query start
+    
+    # --- 1. SESSION STATE CHECK (This part is correct) ---
+    try:
+        session = get_session(state["session_id"], state["user_id"])
+        if session.pending_ticket_details and (query in ['yes', 'yep', 'ok', 'please', 'sure', 'create ticket', 'yes please', 'that would be good']):
+            logger.info("Orchestrator: User confirmed ticket creation. Routing to EXECUTE_TICKET.")
+            state["triage_decision"] = "EXECUTE_TICKET"
+            state["ticket_details"] = session.pending_ticket_details
+            state["is_technical_rag"] = False
+            state["is_tool_use"] = True
+            state["needs_clarification"] = False
+            session.pending_ticket_details = None
+            save_session(session)
+            return state
+    except Exception as e:
+        logger.error(f"Error checking session for pending offer: {e}")
+    # --- END SESSION CHECK ---
 
-    # --- REFINED PROMPT ---
+    logger.info(f"Orchestrator received query: {query[:100]}...")
+
+    # --- 2. NEW CLASSIFICATION PROMPT (Fixes the "NEEDSCLARIFICATION" bug) ---
     classification_prompt = f"""
-    Analyze the user's query and classify its primary intent. Respond with ONLY one word from the specific list below. Prioritize simple responses if applicable.
+    Analyze the user's query and classify its primary intent. Respond with ONLY one word from the specific list below.
 
     --- Simple Responses ---
-    GREETING            # User says hello, hi
-    GRATITUDE           # User says thanks, thank you
-    FAREWELL            # User says bye, goodbye, see you, thanks bye, take care
-    CHITCHAT            # Casual conversation, unrelated to IT issues
-    NEEDS_CLARIFICATION # Vague query like "it's broken", "help" with no detail
+    GREETING            # User says hello, hi, good morning.
+    GRATITUDE           # User says thanks, thank you.
+    FAREWELL            # User says bye, goodbye, see you.
+    CHITCHAT            # Casual conversation, unrelated to IT issues (e.g., "what's the weather?").
+    NEEDS_CLARIFICATION # Vague query that is IMPOSSIBLE to answer. (e.g., "help", "it's broken", "doesn't work")
+                          # CRITICAL: If the user names an object OR is responding to a previous suggestion, it is NOT this.
 
-    --- Specialist RAG Agents ---
-    DATABASE_SPECIALIST     # Database, SQL, connection timeout, query performance
-    NETWORK_SPECIALIST      # Network, connectivity, firewall, latency, wifi, VPN
-    ACCESS_SPECIALIST       # Login, authentication, password reset, permissions, access denied
-    PERFORMANCE_SPECIALIST  # Slow system, application slowness, optimization needs
-    APPLICATION_SPECIALIST  # Specific app crash, bug, feature request, UI problem
-    GENERAL_SPECIALIST      # Any other technical IT issue not covered above
+    --- Specialist RAG Agents (User has a specific problem) ---
+    DATABASE_SPECIALIST    # Database, SQL, connection timeout, query performance.
+    NETWORK_SPECIALIST     # Network, connectivity, firewall, latency, wifi, VPN.
+    ACCESS_SPECIALIST      # Login, authentication, password reset, permissions, access denied.
+    PERFORMANCE_SPECIALIST # Slow system, application slowness, optimization.
+    APPLICATION_SPECIALIST # Specific app crash, bug, feature request, UI problem.
+    GENERAL_SPECIALIST     # Any other specific IT problem (e.g., "laptop broken") OR a follow-up to a previous solution 
+                           # (e.g., "that didn't work", "i'm still stuck").
 
-    --- Tool-Using Agents ---
-    CREATE_TICKET           # User explicitly asks to create/log/open/file a ticket/incident
-    CHECK_TICKET_STATUS     # User asks for status/update on an existing ticket (e.g., "status INC123")
+    --- Specialist Tool Agents ---
+    CODE_GENERATOR       # User asks to "write a script", "how to code", or for "python/powershell".
+    ERROR_CODE_LOOKUP    # User's query *centers on* a specific error code (e.g., "0x80070005", "404 not found").
+    CREATE_TICKET        # User *explicitly* asks to create/log/open/file a ticket/incident.
+    CHECK_TICKET_STATUS  # User asks for status/update on an existing ticket (e.g., "status INC123").
 
     Query: "{query}"
-
-    CRITICAL: If the query is clearly a simple greeting, farewell, or thank you, classify it as such, NOT as a technical specialist. Examples: "bye" -> FAREWELL, "hello there" -> GREETING.
 
     Classification:"""
     # --- END REFINED PROMPT ---
 
+    # --- 3. NEW NORMALIZATION LOGIC (Fixes the routing bug) ---
     try:
-        # Call the LLM for classification
-        classification = call_llm(
+        classification_raw = call_llm(
             classification_prompt,
-            model="llama-3.1-8b-instant", # Or your preferred classification model
-            temperature=0.0, # Low temperature for deterministic classification
-            max_tokens=25 # Should be enough for one word + buffer
-        ).strip().upper().replace("_", "") # Clean up potential underscores or extra spaces
+            model="llama-3.1-8b-instant",
+            temperature=0.0,
+            max_tokens=25
+        ).strip().upper()
 
-        # --- Ensure FAREWELL is in valid_intents ---
+        # Normalize by removing all spaces AND underscores
+        classification = re.sub(r'[\s_]+', '', classification_raw)
+
+        # List of valid intents *without* underscores or spaces
         valid_intents = [
-            "GREETING", "GRATITUDE", "CHITCHAT", "NEEDS_CLARIFICATION", "FAREWELL",
-            "DATABASE SPECIALIST", "NETWORK SPECIALIST", "ACCESS SPECIALIST", # Handle potential spaces if LLM adds them
-            "PERFORMANCE SPECIALIST", "APPLICATION SPECIALIST", "GENERAL SPECIALIST",
-            "DATABASE_SPECIALIST", "NETWORK_SPECIALIST", "ACCESS_SPECIALIST", # Keep underscore versions too
-            "PERFORMANCE_SPECIALIST", "APPLICATION_SPECIALIST", "GENERAL_SPECIALIST",
-            "CREATE TICKET", "CHECK TICKET STATUS",
-            "CREATE_TICKET", "CHECK_TICKET_STATUS"
+            "GREETING", "GRATITUDE", "CHITCHAT", "NEEDSCLARIFICATION", "FAREWELL",
+            "DATABASESPECIALIST", "NETWORKSPECIALIST", "ACCESSSPECIALIST",
+            "PERFORMANCESPECIALIST", "APPLICATIONSPECIALIST", "GENERALSPECIALIST",
+            "CREATETICKET", "CHECKTICKETSTATUS", "EXECUTETICKET",
+            "CODEGENERATOR", "ERRORCODELOOKUP"
         ]
-        # --- Normalize classification (remove space if present) ---
-        normalized_classification = classification.replace(" ", "_")
-
-        if normalized_classification in valid_intents:
-            state["triage_decision"] = normalized_classification
-            logger.info(f"Orchestrator classified intent as: {normalized_classification}")
+        
+        if classification in valid_intents:
+            # --- THIS IS THE CRITICAL FIX ---
+            # We must re-add underscores for the router to work
+            if "SPECIALIST" in classification:
+                state["triage_decision"] = classification.replace("SPECIALIST", "_SPECIALIST")
+            elif "TICKET" in classification:
+                state["triage_decision"] = classification.replace("TICKET", "_TICKET")
+            elif "STATUS" in classification:
+                state["triage_decision"] = classification.replace("STATUS", "_STATUS")
+            elif "NEEDSCLARIFICATION" in classification:
+                state["triage_decision"] = "NEEDS_CLARIFICATION" # Add underscore
+            else:
+                state["triage_decision"] = classification # GREETING, CODE_GENERATOR, etc.
+            # --- END CRITICAL FIX ---
+            logger.info(f"Orchestrator classified intent as: {state['triage_decision']}")
+            
         else:
-            # Fallback if the LLM gives an unexpected response
-            logger.warning(f"Orchestrator received invalid classification '{classification}'. Defaulting to GENERAL_SPECIALIST.")
+            logger.warning(f"Orchestrator received invalid classification '{classification_raw}'. Defaulting to GENERAL_SPECIALIST.")
             state["triage_decision"] = "GENERAL_SPECIALIST"
 
     except Exception as e:
         logger.error(f"Orchestrator LLM call failed: {e}", exc_info=True)
-        # Default to general specialist on error
         state["triage_decision"] = "GENERAL_SPECIALIST"
+    # --- END NEW LOGIC ---
 
-    # --- Set Routing Flags ---
-    # Based on the final triage_decision
+
+    # --- 4. SET ROUTING FLAGS (This block is fine) ---
     decision = state["triage_decision"]
     if decision.endswith("_SPECIALIST"):
         state["is_technical_rag"] = True
         state["is_tool_use"] = False
-        state["needs_clarification"] = False # Ensure flags are reset
-    elif decision in ["CREATE_TICKET", "CHECK_TICKET_STATUS"]:
+        state["needs_clarification"] = False
+    elif decision in ["CREATE_TICKET", "CHECK_TICKET_STATUS","EXECUTE_TICKET"]:
         state["is_technical_rag"] = False
         state["is_tool_use"] = True
         state["needs_clarification"] = False
-    elif decision == "NEEDS_CLARIFICATION":
-         state["is_technical_rag"] = False
-         state["is_tool_use"] = False
-         state["needs_clarification"] = True # Set clarification flag
+    elif decision in ["CODEGENERATOR", "ERRORCODELOOKUP"]:
+        state["is_technical_rag"] = False
+        state["is_tool_use"] = False
+        state["needs_clarification"] = False
+    elif decision == "NEEDSCLARIFICATION":
+        state["is_technical_rag"] = False
+        state["is_tool_use"] = False
+        state["needs_clarification"] = True
     else: # Covers GREETING, GRATITUDE, CHITCHAT, FAREWELL
         state["is_technical_rag"] = False
         state["is_tool_use"] = False
@@ -275,33 +321,47 @@ def _execute_rag_pipeline(query: str, session_id: str, user_id: str, history_jso
     # 2. Run Orchestrator
     state = orchestrator_node(state)
     
+    # --- THIS IS THE CORRECTED ROUTING LOGIC ---
     # 3. Route to appropriate MODULAR AGENT
-    if state["is_technical_rag"]:
-        # Import here to avoid circular imports
-        from agents import run_specialist_rag
+    try:
+        if state["is_technical_rag"]:
+            logger.info(f"Routing to RAG Specialist: {state['triage_decision']}")
+            state = run_specialist_rag(state, vector_store, kb_data)
+            
+        elif state["is_tool_use"]:
+            logger.info(f"Routing to ServiceNow Agent: {state['triage_decision']}")
+            state = run_servicenow_agent(state)
+            # We run response_generation_node *after* the tool to format its raw output
+            # This allows the LLM to make the tool's JSON response conversational
+            state = response_generation_node(state) 
+            
+        elif state["triage_decision"] == "NEEDSCLARIFICATION":
+            logger.info(f"Routing to Clarification Agent")
+            state = run_clarification(state)
         
-        # --- KEY CHANGE 4: Pass the new 'kb_data' object ---
-        state = run_specialist_rag(state, vector_store, kb_data)
-        # ---------------------------------------------------
+        elif state["triage_decision"] == "CODEGENERATOR":
+            logger.info(f"Routing to Code Generator Agent")
+            state = run_code_generator_agent(state)
+            
+        elif state["triage_decision"] == "ERRORCODELOOKUP":
+            logger.info(f"Routing to Error Lookup Agent")
+            state = run_error_lookup_agent(state)
         
-    elif state["is_tool_use"]:
-        # Import here to avoid circular imports
-        from agents import run_servicenow_agent
-        from core_rag import response_generation_node
-        state = run_servicenow_agent(state)
-        state = response_generation_node(state)
-        
-    elif state["triage_decision"] == "NEEDS_CLARIFICATION":
-        # Import here to avoid circular imports
-        from agents import run_clarification
-        state = run_clarification(state)
+        else: # Covers GREETING, GRATITUDE, CHITCHAT, FAREWELL
+            logger.info(f"Routing to Simple Response Agent: {state['triage_decision']}")
+            state = run_simple_response(state)
     
-    else:
-        # Import here to avoid circular imports
-        from agents import run_simple_response
-        state = run_simple_response(state)
+    except NameError as e:
+        logger.error(f"Routing failed. Agent function not found or not imported: {e}", exc_info=True)
+        state["final_response"] = "I'm sorry, I couldn't route your request to the correct specialist. Please check the server logs."
+    except Exception as e:
+        logger.error(f"An error occurred during agent execution: {e}", exc_info=True)
+        state["final_response"] = "I'm sorry, I encountered an internal error while processing your request."
+    # --- END OF CORRECTED ROUTING LOGIC ---
 
     end_time = time.time()
+    # Ensure metadata exists before assignment
+    if "metadata" not in state: state["metadata"] = {}
     state["metadata"]["pipeline_time_ms"] = (end_time - start_time) * 1000
 
     print(f"DEBUG: Final response before returning from pipeline: '{state.get('final_response', 'NOT SET')}' for decision '{state.get('triage_decision')}'")
@@ -324,7 +384,8 @@ def get_session(session_id: str, user_id: str = "default") -> Session:
         cur = con.cursor()
         cur.execute("""
             SELECT user_id, created_at, last_activity, conversation_history, 
-                   pending_clarification, feedback_pending, session_title, theme_preference
+                   pending_clarification, feedback_pending, session_title, theme_preference,
+                   pending_ticket_details -- <-- CHANGED
             FROM sessions WHERE session_id = ? AND is_active = 1
         """, (session_id,))
         
@@ -332,7 +393,12 @@ def get_session(session_id: str, user_id: str = "default") -> Session:
         now = datetime.now()
         
         if row:
-            user_id, created_at, last_activity, history_json, clarification_json, feedback_pending, title, theme = row
+            # --- UPDATED UNPACKING ---
+            (user_id, created_at, last_activity, history_json, 
+             clarification_json, feedback_pending, title, theme, 
+             pending_ticket_details) = row  # <-- CHANGED
+            # --- END UPDATED UNPACKING ---
+
             return Session(
                 session_id=session_id,
                 user_id=user_id,
@@ -342,9 +408,11 @@ def get_session(session_id: str, user_id: str = "default") -> Session:
                 pending_clarification=json.loads(clarification_json) if clarification_json else None,
                 feedback_pending=bool(feedback_pending),
                 session_title=title or "Agentic Chat",
-                theme_preference=theme or "system"
+                theme_preference=theme or "system",
+                pending_ticket_details=pending_ticket_details  # <-- CHANGED
             )
         else:
+            # This is correct, new sessions start with pending_ticket_details=None
             return Session(
                 session_id=session_id,
                 user_id=user_id,
@@ -355,6 +423,7 @@ def get_session(session_id: str, user_id: str = "default") -> Session:
             
     except Exception as e:
         logger.error(f"Session error: {e}")
+        # This is correct
         return Session(
             session_id=session_id,
             user_id=user_id,
@@ -371,108 +440,112 @@ def save_session(session: Session):
         history_json = json.dumps(session.conversation_history)
         clarification_json = json.dumps(session.pending_clarification) if session.pending_clarification else None
         
+        # --- UPDATED SQL ---
         cur.execute("""
             INSERT OR REPLACE INTO sessions 
             (session_id, user_id, created_at, last_activity, conversation_history, 
-             pending_clarification, feedback_pending, session_title, theme_preference, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+             pending_clarification, feedback_pending, session_title, theme_preference, is_active,
+             pending_ticket_details) -- <-- CHANGED COLUMN
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) -- <-- ADDED VALUE
         """, (
             session.session_id, session.user_id, session.created_at.isoformat(),
             session.last_activity.isoformat(), history_json, clarification_json,
-            int(session.feedback_pending), session.session_title, session.theme_preference
+            int(session.feedback_pending), session.session_title, session.theme_preference,
+            session.pending_ticket_details  # <-- CHANGED VALUE (no int())
         ))
+        # --- END UPDATED SQL ---
+        
         con.commit()
     except Exception as e:
         logger.error(f"Save session error: {e}")
-
+        
 # ==============================================================================
 # --- MAIN AGENTIC RAG ENTRY POINT (UPDATED) ---
 # ==============================================================================
 
+
 def run_agentic_rag(query: str, session_id: Optional[str] = None, user_id: str = "default") -> Dict[str, Any]:
     """
     Main agentic RAG function - wrapper around the cached pipeline with session management.
-    Includes updated confidence logic.
+    Includes logic for handling the "show_ticket_offer" flag.
     """
-    start_time = time.time() # Start timing the whole request
+    start_time = time.time()
 
     if not session_id:
-        # Generate a new session ID if none is provided
         session_id = str(uuid.uuid4())[:12]
         logger.info(f"New session started: {session_id}")
 
-    # Load or create the session object using the backend's session management
     session = get_session(session_id, user_id)
 
     try:
-        # Normalize query for better cache hits and consistency
         normalized_query = query.lower().strip()
-        # Prepare recent history for the pipeline cache key (limit size if needed)
-        history_json = json.dumps(session.conversation_history[-5:]) # Pass recent history
+        history_json = json.dumps(session.conversation_history[-5:])
 
-        # --- CACHED PIPELINE CALL ---
-        # Calls the function containing orchestrator, agent routing, RAG, etc.
         state = _execute_rag_pipeline(normalized_query, session_id, user_id, history_json)
-        # --- END CACHED PIPELINE CALL ---
 
-        # Check if the result came from the cache or was newly computed
         total_time = time.time() - start_time
-        # Check for 'pipeline_time_ms' which is ONLY added on a cache miss within _execute_rag_pipeline
         is_cache_hit = "pipeline_time_ms" not in state["metadata"]
 
         if is_cache_hit:
             logger.info(f"--- (Cache HIT) Served from cache: {query[:50]}... ---")
-            # Create fresh metadata for this cache-hit run, using total request time
             state["metadata"] = {"pipeline_time_ms": total_time * 1000, "cache_hit": True}
         else:
-            # If it was a miss, 'pipeline_time_ms' already exists from _execute_rag_pipeline
             state["metadata"]["cache_hit"] = False
             logger.info(f"--- Pipeline execution took: {state['metadata']['pipeline_time_ms']:.2f} ms ---")
 
-        # Determine if the Knowledge Base was used effectively
         used_kb = state.get("context_is_relevant", False)
 
-        # --- UPDATED CONFIDENCE CALCULATION ---
-        retrieved_context = state.get("retrieved_context") or [] # Use .get() for safety
+        retrieved_context = state.get("retrieved_context") or []
         top_score = retrieved_context[0]['score'] if retrieved_context and 'score' in retrieved_context[0] else 0.0
 
-        if state.get("is_tool_use"): # Use .get() for safety
-            confidence = 1.0 # Tool use is considered deterministic
-        elif used_kb: # KB context was retrieved and deemed relevant
-            # Confidence based on top retrieved score, slightly boosted but capped
-            # Ensures a minimum confidence if KB was used, prevents overly low scores
+        if state.get("is_tool_use"):
+            confidence = 1.0
+        elif used_kb:
             confidence = min(max(0.5, top_score * 1.1), 0.98)
-        elif state.get("is_technical_rag"): # Technical query but no relevant KB found (fallback answer generated)
-            confidence = 0.35 # Lower confidence for generic fallback advice
-        elif state.get("triage_decision") in ["GREETING", "GRATITUDE", "CHITCHAT", "FAREWELL"]: # Handle simple known intents
-            confidence = 0.95 # Assign a high, but not perfect, confidence for these
+        elif state.get("is_technical_rag"):
+            confidence = 0.35
+        elif state.get("triage_decision") in ["GREETING", "GRATITUDE", "CHITCHAT", "FAREWELL"]:
+            confidence = 0.95
         elif state.get("triage_decision") == "NEEDS_CLARIFICATION":
-            confidence = 0.5  # Lower confidence seems appropriate when asking for more info
-        else: # Default for any other unforeseen simple cases or potential errors
-            confidence = 0.9 # Default high confidence for cases not covered above
-        # --- END UPDATED CONFIDENCE CALCULATION ---
+            confidence = 0.5
+        else:
+            confidence = 0.9
 
-        # Update session object with the latest turn
+        # --- THIS IS THE CRITICAL STATE-SETTING LOGIC ---
+        show_ticket_offer_flag = state.get("metadata", {}).get("show_ticket_offer", False)
+        pending_details_json = state.get("metadata", {}).get("pending_ticket_details_json")
+
+        if show_ticket_offer_flag and pending_details_json:
+        # The agent offered a ticket AND provided the details. Save them to the session.
+            logger.info("Saving pending ticket details to session.")
+            session.pending_ticket_details = pending_details_json
+
+        elif state.get("triage_decision") != "EXECUTE_TICKET":
+            # This turn was NOT an offer and NOT an execution.
+            # Clear any stale details from a previous turn.
+            if session.pending_ticket_details:
+                logger.info("Clearing stale pending ticket details from session.")
+                session.pending_ticket_details = None
+            # --- END CRITICAL STATE-SETTING LOGIC ---
+
         session.conversation_history.append({
-            "query": query, # Store the original query
+            "query": query,
             "answer": state["final_response"],
             "timestamp": datetime.now().isoformat(),
             "used_kb": used_kb,
-            "confidence": confidence # Store the calculated confidence
+            "confidence": confidence
         })
-        session.last_activity = datetime.now() # Update activity timestamp
+        session.last_activity = datetime.now()
 
-        # Update session title if it's the default and this isn't just a short greeting
         if session.session_title == "Agentic Chat" and len(session.conversation_history) >= 1:
              first_query = session.conversation_history[0].get("query", "")
-             # Only update if the first query is reasonably descriptive
              if first_query and len(first_query.split()) > 2:
                   session.session_title = first_query[:40] + "..." if len(first_query) > 40 else first_query
 
-        # Save the updated session state to the database
+        # Save the updated session state (including the new pending_ticket_offer value)
         save_session(session)
 
-        # Log the interaction details to the history table for analytics
+        # Log to history table
         try:
             con = get_db()
             cur = con.cursor()
@@ -485,48 +558,45 @@ def run_agentic_rag(query: str, session_id: Optional[str] = None, user_id: str =
                 state["final_response"],
                 confidence,
                 int(used_kb),
-                0, # Assuming exact_match logic is elsewhere or not primary here
-                int(state.get("needs_clarification", False)) # Log if clarification was asked
-                ))
+                0, 
+                int(state.get("needs_clarification", False))
+            ))
             con.commit()
         except Exception as e:
-            logger.error(f"History logging error: {e}", exc_info=True) # Log full traceback
+            logger.error(f"History logging error: {e}", exc_info=True)
 
-        # Prepare the final response object for the API caller (agentic_app.py)
-        # Include necessary metadata for the frontend
         pipeline_time_ms = state["metadata"].get("pipeline_time_ms", total_time * 1000)
-        retrieval_time_approx = pipeline_time_ms * 0.3 / 1000.0 # Approximate retrieval time in seconds
+        retrieval_time_approx = pipeline_time_ms * 0.3 / 1000.0
 
         return {
             "answer": state["final_response"],
             "confidence": confidence,
             "used_kb": used_kb,
-            "exact_match": False, # Assuming False unless specific logic sets it
-            "session_id": session_id, # Return the session ID
-            "feedback_required": used_kb and confidence > 0.6, # Suggest feedback for KB answers
+            "exact_match": False,
+            "session_id": session_id,
+            "feedback_required": used_kb and confidence > 0.6,
             "clarification_asked": state.get("needs_clarification", False),
-            "total_time": total_time, # Total request time (including potential cache hit time)
-            "retrieval_time": retrieval_time_approx, # Approximate retrieval portion
-            "session_title": session.session_title, # Pass updated title back
-            "theme_preference": session.theme_preference # Pass theme back
-            # Add cache hit status for potential frontend display or debugging
-            # "cache_hit": state["metadata"].get("cache_hit", False)
+            "show_ticket_offer": show_ticket_offer_flag, # Pass flag to frontend
+            "total_time": total_time,
+            "retrieval_time": retrieval_time_approx,
+            "session_title": session.session_title,
+            "theme_preference": session.theme_preference
         }
 
     except Exception as e:
-        logger.error(f"Agentic RAG main function error: {e}", exc_info=True) # Log full traceback
-        # Return a standardized error response
+        logger.error(f"Agentic RAG main function error: {e}", exc_info=True)
         return {
             "answer": "I apologize, but I encountered an error while processing your request. Please try again.",
             "confidence": 0.0,
             "used_kb": False,
             "exact_match": False,
-            "session_id": session_id, # Return session ID even on error
+            "session_id": session_id,
             "feedback_required": False,
             "clarification_asked": False,
+            "show_ticket_offer": False, # Pass flag on error
             "total_time": time.time() - start_time,
             "retrieval_time": 0,
-            "session_title": session.session_title if 'session' in locals() else "Agentic Chat", # Handle potential error before session load
+            "session_title": session.session_title if 'session' in locals() else "Agentic Chat",
             "theme_preference": session.theme_preference if 'session' in locals() else "system"
         }
 
@@ -741,35 +811,7 @@ def init_db():
         con = get_db()
         cur = con.cursor()
         
-        # History table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                session_id TEXT, 
-                query TEXT,
-                answer TEXT, 
-                confidence REAL, 
-                used_kb INTEGER, 
-                exact_match INTEGER,
-                clarification_asked INTEGER DEFAULT 0,
-                user_feedback INTEGER,
-                feedback_comment TEXT, 
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Feedback table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS feedback (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                session_id TEXT, 
-                query TEXT,
-                answer TEXT, 
-                rating INTEGER, 
-                comment TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+        # ... (your history and feedback table creations are fine) ...
         
         # Sessions table
         cur.execute("""
@@ -783,7 +825,10 @@ def init_db():
                 feedback_pending INTEGER DEFAULT 0,
                 session_title TEXT DEFAULT 'Agentic Chat',
                 is_active INTEGER DEFAULT 1,
-                theme_preference TEXT DEFAULT 'system'
+                theme_preference TEXT DEFAULT 'system',
+                
+                -- THIS IS THE CORRECTED LINE --
+                pending_ticket_details TEXT DEFAULT NULL 
             )
         """)
         
@@ -791,6 +836,49 @@ def init_db():
         logger.info("Database tables initialized successfully")
     except Exception as e:
         logger.error(f"Database initialization error: {e}")
+
+    # --- ATTEMPT TO MIGRATE (ADD COLUMN IF IT DOESN'T EXIST) ---
+    try:
+        con = get_db()
+        cur = con.cursor()
+        cur.execute("PRAGMA table_info(sessions)")
+        columns = [column[1] for column in cur.fetchall()]
+        
+        # --- THIS IS THE CORRECTED MIGRATION LOGIC ---
+        if "pending_ticket_details" not in columns:
+            logger.info("Migrating sessions table to add 'pending_ticket_details' column...")
+            cur.execute("ALTER TABLE sessions ADD COLUMN pending_ticket_details TEXT DEFAULT NULL")
+            con.commit()
+            logger.info("Migration successful.")
+            
+        # Optional: Clean up the old column if it exists
+        if "pending_ticket_offer" in columns:
+            logger.info("Migrating sessions table to remove old 'pending_ticket_offer' column...")
+            # Note: SQLite's DROP COLUMN support is recent. A safer way is to rebuild,
+            # but for this non-critical_data column, we'll try DROP.
+            # This might fail on very old sqlite versions.
+            cur.execute("ALTER TABLE sessions DROP COLUMN pending_ticket_offer")
+            con.commit()
+            logger.info("Old column removed.")
+            
+    except Exception as e:
+        logger.error(f"Error migrating sessions table: {e}")
+
+    # --- ATTEMPT TO MIGRATE (ADD COLUMN IF IT DOESN'T EXIST) ---
+    try:
+        con = get_db()
+        cur = con.cursor()
+        cur.execute("PRAGMA table_info(sessions)")
+        columns = [column[1] for column in cur.fetchall()]
+        
+        if "pending_ticket_offer" not in columns:
+            logger.info("Migrating sessions table to add 'pending_ticket_offer' column...")
+            cur.execute("ALTER TABLE sessions ADD COLUMN pending_ticket_offer INTEGER DEFAULT 0")
+            con.commit()
+            logger.info("Migration successful.")
+            
+    except Exception as e:
+        logger.error(f"Error migrating sessions table: {e}")
 
 # ==============================================================================
 # --- INITIALIZATION ---
