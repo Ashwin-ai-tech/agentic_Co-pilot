@@ -36,6 +36,22 @@ from agentic_backend import (
 
 # --- Flask App Setup ---
 app = Flask(__name__, static_folder='static', static_url_path='')
+# --- DEVELOPMENT FIX: Disable all caching ---
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+
+@app.after_request
+def add_header(response):
+    """
+    Add headers to both force-disable caching for development.
+    """
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '-1'
+    return response
+
+
+logger.info("Cache disabled for development.")
+# ---------------------------------------------
 database.init_app(app) # Initialize DB connection handling via database.py
 
 # Helper function to get session data
@@ -312,10 +328,15 @@ def chat_stream():
                 'type': 'complete',
                 'confidence': result.get('confidence', 0),
                 'used_kb': result.get('used_kb', False),
-                'session_id': returned_session_id, # Send back the correct session_id
+                'session_id': returned_session_id,
                 'feedback_required': result.get('feedback_required', False),
-                'session_title': result.get('session_title', 'Agentic Chat'), # Include title
-                'theme_preference': result.get('theme_preference', 'system') # Include theme
+                'session_title': result.get('session_title', 'Agentic Chat'),
+                'theme_preference': result.get('theme_preference', 'system'),
+                'show_ticket_offer': result.get('show_ticket_offer', False),
+ 
+                # --- ADD THIS LINE ---
+                'ticket_details': result.get("metadata", {}).get("pending_ticket_details_json")
+                # ---------------------
             })}\n\n"
 
         except Exception as e:
@@ -441,14 +462,20 @@ def create_new_session_route():
 def delete_session_route(session_id):
     """Delete (mark as inactive) a session."""
     try:
-        data = request.json or {} # Allow user_id in body or args
+        # --- THIS IS THE FIX ---
+        try:
+            data = request.json or {} # Try to get JSON
+        except Exception:
+            data = {} # Default to empty dict if body is empty or not JSON
+        # --- END OF FIX ---
+ 
         user_id = data.get('user_id', request.args.get('user_id', 'default'))
-
+ 
         # Use the backend function
         success = delete_session(session_id, user_id)
-
+ 
         return jsonify({'success': success})
-
+ 
     except Exception as e:
         logger.error(f"Error deleting session {session_id}: {e}", exc_info=True)
         return jsonify({'success': False, 'message': str(e)}), 500
@@ -575,7 +602,6 @@ def get_admin_dashboard_data():
         return jsonify(admin_data)
     except Exception as e:
         logger.error(f"Error getting admin dashboard data: {e}", exc_info=True)
-        
         return jsonify({'error': 'Internal server error', 'message': str(e)}), 500
 
 @app.route('/api/analytics/details', methods=['GET'])
